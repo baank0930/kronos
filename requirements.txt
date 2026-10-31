@@ -1,0 +1,14 @@
+# 新規Streamlitアプリ用の依存ライブラリ
+# CPU版PyTorchを使い、通常のLinux用GPU依存を避けます。Python 3.10〜3.13を想定。
+--extra-index-url https://download.pytorch.org/whl/cpu
+streamlit>=1.38,<2
+numpy>=1.26,<3
+pandas>=2.2,<3
+torch==2.5.1+cpu
+einops==0.8.1
+huggingface_hub==0.33.1
+safetensors==0.6.2
+yfinance>=0.2.54,<2
+pandas_market_calendars>=4.4,<6
+matplotlib>=3.8,<4
+tqdm>=4.66,<5
