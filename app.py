@@ -155,6 +155,47 @@ def prepare_data(ticker: str, horizon: int) -> dict:
             "zero_volume": zero_volume, "flat_ohlc": flat_ohlc}
 
 
+def set_prediction_origin(prepared: dict, mode: int, specified_date: date, requested_horizon: int) -> dict:
+    """Cut off the model's data at the origin; keep later rows only for display/evaluation."""
+    raw_full = prepared["raw"]
+    latest_available = pd.Timestamp(raw_full.index[-1])
+    if mode == -1:
+        if specified_date > prepared["local_today"]:
+            raise ValueError("起点日には未来の日付を指定できません。")
+        matches = np.flatnonzero(raw_full.index <= pd.Timestamp(specified_date))
+        if not len(matches):
+            raise ValueError("指定日以前のデータがありません。日付を見直してください。")
+        i = int(matches[-1])
+    else:
+        i = len(raw_full) - 1 - int(mode)
+    if i < LOOKBACK - 1:
+        raise ValueError(f"指定した起点までに{LOOKBACK}本の有効な日足がありません。")
+    anchor = pd.Timestamp(raw_full.index[i]).normalize()
+    holdout = raw_full.iloc[i + 1:].copy()
+    input_raw = raw_full.iloc[:i + 1].copy()
+    # 既に取得済みの1〜5本を比較したい場合は、自動的に予測長を延ばす。
+    actual_steps = len(holdout)
+    horizon = max(int(requested_horizon), actual_steps) if 0 < actual_steps <= 5 else int(requested_horizon)
+    cal = mcal.get_calendar(prepared["setting"]["calendar"])
+    future = cal.schedule(start_date=str((anchor + pd.Timedelta(days=1)).date()),
+                          end_date=str((anchor + pd.Timedelta(days=120)).date()))
+    if len(future) < horizon:
+        raise ValueError("予測先の取引日を十分取得できません。")
+    dates = []
+    for value in future.index[:horizon]:
+        item = pd.Timestamp(value)
+        dates.append((item.tz_localize(None) if item.tzinfo is not None else item).normalize())
+    hist = input_raw.tail(LOOKBACK)
+    updated = dict(prepared)
+    updated.update({"raw": input_raw, "hist": hist, "last": anchor, "future_dates": dates,
+                    "latest_available": latest_available, "holdout": holdout,
+                    "origin_offset": actual_steps, "requested_horizon": int(requested_horizon),
+                    "horizon": horizon, "mode": mode, "specified_date": specified_date,
+                    "zero_volume": int((hist["volume"] == 0).sum()),
+                    "flat_ohlc": int((hist[["open", "high", "low", "close"]].nunique(axis=1) == 1).sum())})
+    return updated
+
+
 def sample_paths(predictor, hist: pd.DataFrame, dates: list[pd.Timestamp]) -> tuple[np.ndarray, int]:
     frame = hist.reset_index(drop=True)
     x_dates = pd.Series(hist.index)
@@ -232,13 +273,18 @@ def daily_mean(paths: np.ndarray, dates: list[pd.Timestamp], anchor: float) -> p
     return df[["先", "日付目安", "終値", "最新終値比(%)", "始値", "高値", "安値", "高安幅", "幅率_安値比(%)", "出来高"]]
 
 
-def forecast_figure(hist: pd.DataFrame, paths_by_model: dict, horizon: int, currency: str):
+def forecast_figure(hist: pd.DataFrame, paths_by_model: dict, horizon: int, currency: str, dates: list[pd.Timestamp], actual: pd.DataFrame):
     fig, axes = plt.subplots(2, 1, figsize=(10, 7.5), sharex=True, sharey=True, constrained_layout=True)
     history = hist["close"].reset_index(drop=True)
     last_close = float(history.iloc[-1])
     view_count = min(16, len(history))
     hx = list(range(-view_count + 1, 1))
-    fx = list(range(horizon + 1))
+    # Align by date, not by row number: calendar estimates and actual data can differ.
+    future_axis = sorted(set(pd.Timestamp(x).normalize() for x in dates) | set(pd.Timestamp(x).normalize() for x in actual.index))
+    positions = {dt: i + 1 for i, dt in enumerate(future_axis)}
+    fx = [0] + [positions[pd.Timestamp(x).normalize()] for x in dates]
+    actual_x = [0] + [positions[pd.Timestamp(x).normalize()] for x in actual.index]
+    actual_y = np.r_[last_close, actual["close"].to_numpy(dtype=float)]
     for ax, name, color in zip(axes, ("mini", "small"), ("#2563eb", "#bc4a2b")):
         samples = paths_by_model[name][:, :, 3]
         mean = samples.mean(axis=0)
@@ -247,17 +293,20 @@ def forecast_figure(hist: pd.DataFrame, paths_by_model: dict, horizon: int, curr
             ax.plot(fx, np.r_[last_close, samples[j]], color=color, alpha=.3, lw=1,
                     label="Sample paths" if j == 0 else "_nolegend_")
         ax.plot(fx, np.r_[last_close, mean], color=color, ls="--", marker="o", lw=2, label="Mean")
+        if len(actual):
+            ax.plot(actual_x, actual_y, color="#111827", marker="o", lw=2.1, label="Actual (after origin)")
         ma = pd.concat([history, pd.Series(mean)], ignore_index=True).rolling(10, min_periods=10).mean()
         ax.plot(hx, ma.iloc[len(history)-view_count:len(history)], color="#17825d", lw=1.5, label="MA10")
         ax.plot(fx, ma.iloc[len(history)-1:], color="#17825d", ls="--", lw=1.5, label="MA10 with forecast")
         ax.axvline(0, color="#777", ls=":")
-        ax.axvspan(0, horizon, color="#fff4df", alpha=.55)
+        ax.axvspan(0, fx[-1], color="#fff4df", alpha=.55)
         ax.set_title(f"Kronos {name}")
         ax.set_ylabel(f"Adjusted price ({currency})")
         ax.grid(True, linestyle=":", alpha=.5)
         ax.legend(ncol=2, fontsize=8)
-    axes[-1].set_xticks([-15, -10, -5, 0] + list(range(1, horizon + 1)))
-    axes[-1].set_xlabel("Trading steps (0 = latest input)")
+    ticks = sorted(set([-15, -10, -5, 0] + fx[1:] + ([actual_x[-1]] if len(actual) else [])))
+    axes[-1].set_xticks(ticks)
+    axes[-1].set_xlabel("Date-aligned steps (0 = forecast origin)")
     return fig
 
 
@@ -275,6 +324,12 @@ with st.form("kronos_compare_settings"):
     horizon = c1.selectbox("予測する営業日数", options=[1, 2, 3, 4, 5], index=2)
     backtest_count = c2.selectbox("過去検証の起点数", options=[0, 10, 20, 40, 60], index=0, help="初期値0は予測のみ。40〜60起点はCPUで時間がかかります。")
     today = datetime.now(timezone.utc).date()
+    c5, c6 = st.columns(2)
+    origin_mode = c5.selectbox("予測の起点", options=[0, 1, 2, 3, 4, 5, -1],
+        format_func=lambda x: "最新データ" if x == 0 else ("日付を指定" if x == -1 else f"最新から{x}本前"),
+        help="『5本前』なら最新の確定日足から5行前までを入力し、その後の実績と比較します。")
+    origin_date = c6.date_input("起点日（日付を指定した場合のみ）", value=today - timedelta(days=7),
+        help="休場日・データ欠損日は指定日以前で最も近い日足を起点にします。")
     c3, c4 = st.columns(2)
     start = c3.date_input("検証開始日", value=today - timedelta(days=365))
     end = c4.date_input("検証終了日", value=today)
@@ -291,6 +346,8 @@ if run:
             raise ValueError("ティッカーを入力してください。")
         with st.spinner("確定済み日足を取得し、モデルを準備しています。初回は重みのダウンロードがあります。"):
             prepared = prepare_data(ticker, int(horizon))
+            prepared = set_prediction_origin(prepared, int(origin_mode), origin_date, int(horizon))
+            horizon = prepared["horizon"]
             hist = prepared["hist"]
             models = {name: model_for(name) for name in ("mini", "small")}
             latest, invalid = {}, {}
@@ -359,8 +416,17 @@ if result:
             st.error(message + " この予測と検証結果の利用は保留し、元データを確認してください。")
         else:
             st.warning(message)
-    if last < prepared["last_closed"]:
-        st.error(f"データ遅延または売買停止の可能性：最新足 {last.date()} / カレンダー上の直近終了日 {prepared['last_closed'].date()}。予測の利用を保留してください。")
+    if prepared["latest_available"] < prepared["last_closed"]:
+        st.error(f"データ遅延または売買停止の可能性：最新足 {prepared['latest_available'].date()} / カレンダー上の直近終了日 {prepared['last_closed'].date()}。予測の利用を保留してください。")
+    if prepared["mode"] == -1:
+        st.info(f"指定日 {prepared['specified_date']} に対し、利用できる直近の日足 {last.date()} を起点にしました。")
+    if prepared["origin_offset"]:
+        st.info(f"過去起点モード：{last.date()} までのデータで予測。最新の取得済み確定足 {prepared['latest_available'].date()} まで、その後の実績が {prepared['origin_offset']} 本あります。")
+        st.caption("起点より後の価格は予測入力と過去検証の入力には使っていません。ただし現在取得した調整済みデータやモデルを使用するため、当時の完全な再現や学習期間から独立した検証ではありません。")
+        if prepared["horizon"] != prepared["requested_horizon"]:
+            st.info(f"起点からの実績を比較するため、予測日数を {prepared['requested_horizon']} から {prepared['horizon']} に自動延長しました。")
+        if prepared["origin_offset"] > prepared["horizon"]:
+            st.warning("起点から最新までの実績は5本を超えています。予測は選択した日数（最大5本）までで、それ以降は実績のみ表示します。")
     if ticker.endswith(".TWO"):
         st.info("台湾店頭市場はTWSEカレンダーを近似使用しています。")
     if setting["label"] == "米国":
@@ -379,14 +445,49 @@ if result:
             st.warning(f"{name}: 高値・安値・始終値・出来高の不整合が {result['invalid'][name]} 箇所あります。価格を注文条件として利用しないでください。")
     st.dataframe(pd.DataFrame(overview).round(2), hide_index=True, use_container_width=True)
     st.caption("5系列の上向き・下向きはモデル内サンプルの本数。上昇確率ではなく、最小・最大も予測区間ではありません。")
-    fig = forecast_figure(hist, result["latest"], horizon, setting["currency"])
+    actual = prepared["holdout"]
+    fig = forecast_figure(hist, result["latest"], horizon, setting["currency"], dates, actual)
     st.pyplot(fig, clear_figure=True)
     plt.close(fig)
-    st.caption("細線：5系列、太い点線：平均。未来のMA10は平均予測終値を含む計算値です。0は各銘柄の最新入力日。")
+    st.caption("細線：5系列、太い点線：平均、黒線：起点後の実績。未来のMA10は平均予測終値を含む計算値です。0は予測起点。日付が一致しない場合は、欠損を埋めず別の日として扱います。")
+    if len(actual):
+        st.subheader("起点から最新までの実績")
+        observed = pd.concat([hist.tail(1), actual]).copy()
+        actual_table = observed.reset_index(drop=True).rename(columns={"open": "実績始値", "high": "実績高値", "low": "実績安値", "close": "実績終値", "volume": "出来高"})
+        actual_table.insert(0, "日付", [x.strftime("%Y-%m-%d") for x in observed.index])
+        actual_table.insert(0, "起点後の実績本数", range(len(observed)))
+        actual_table["起点終値比(%)"] = (actual_table["実績終値"] / anchor - 1) * 100
+        st.dataframe(actual_table.round(4), hide_index=True, use_container_width=True)
+        st.download_button("起点からの実績CSV", csv_bytes(actual_table), file_name=f"kronos_{ticker.replace('.', '_')}_actual.csv", mime="text/csv")
+        st.subheader("日別比較｜予測平均と実績")
+        forecast_values = {name: result["latest"][name][:, :, 3].mean(axis=0) for name in ("mini", "small")}
+        forecast_by_day = {name: dict(zip(dates, forecast_values[name])) for name in forecast_values}
+        compare_rows = []
+        for dt in sorted(set(dates) | set(actual.index)):
+            realized = float(actual.loc[dt, "close"]) if dt in actual.index else np.nan
+            row = {"日付": dt.strftime("%Y-%m-%d"), "実績終値": realized,
+                   "実績の起点比(%)": (realized / anchor - 1) * 100 if pd.notna(realized) else np.nan}
+            for name in ("mini", "small"):
+                prediction = forecast_by_day[name].get(dt, np.nan)
+                row[f"{name}予測平均"] = prediction
+                row[f"{name}誤差(%)"] = (prediction / realized - 1) * 100 if pd.notna(realized) and pd.notna(prediction) else np.nan
+            compare_rows.append(row)
+        comparison = pd.DataFrame(compare_rows)
+        st.dataframe(comparison.round(4), hide_index=True, use_container_width=True)
+        st.caption("同じ日付同士で比較。空欄は実績または予測がない日、誤差は（予測÷実績−1）です。")
+        st.download_button("予測と実績の日別比較CSV", csv_bytes(comparison), file_name=f"kronos_{ticker.replace('.', '_')}_comparison.csv", mime="text/csv")
+        missing_dates = [dt.strftime("%Y-%m-%d") for dt in dates if dt <= prepared["latest_available"] and dt not in actual.index]
+        if missing_dates:
+            st.warning("カレンダー上の予測日と実績が一致しない日があります：" + "、".join(missing_dates) + "。取引日・欠損を確認してください。")
     for name in ("mini", "small"):
         st.subheader(f"{name}｜日別の5系列平均")
         daily = daily_mean(result["latest"][name], dates, anchor)
-        st.dataframe(daily.round(2), hide_index=True, use_container_width=True)
+        if len(actual):
+            aligned = actual["close"].reindex(pd.DatetimeIndex(dates)).to_numpy(dtype=float)
+            daily["実績終値"] = aligned
+            daily["予測−実績"] = daily["終値"] - daily["実績終値"]
+            daily["予測誤差(%)"] = (daily["終値"] / daily["実績終値"] - 1) * 100
+        st.dataframe(daily.round(4), hide_index=True, use_container_width=True)
         st.download_button(f"{name} 日別平均CSV", csv_bytes(daily), file_name=f"kronos_{ticker.replace('.', '_')}_{name}_daily.csv", mime="text/csv", key=f"download_daily_{name}")
     st.caption("高安幅＝予測高値−予測安値、幅率＝高安幅÷予測安値。いずれも実際の取引可能値幅や予測区間ではありません。")
     path_rows = []
@@ -399,6 +500,8 @@ if result:
     st.download_button("5系列の詳細CSV", csv_bytes(pd.DataFrame(path_rows)), file_name=f"kronos_{ticker.replace('.', '_')}_paths.csv", mime="text/csv")
 
     st.subheader("過去検証")
+    if prepared["origin_offset"]:
+        st.caption(f"複数起点の過去検証は、選択した予測起点 {last.date()} までの実績だけを使用します。")
     if not result["requested"]:
         st.info("過去検証は実施していません。モデルの優劣は判断できません。")
     elif result["bt_error"]:
