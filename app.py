@@ -44,14 +44,44 @@ PATH_COUNT = 5
 THRESHOLD_PCT = 0.5
 
 
+# 以下はYahoo Financeでのシンボル例。商品先物には限月・ロール等の注意がある。
+FUTURES = {
+    "ES=F": ("CME_Equity", "points", "S&P 500先物"),
+    "NQ=F": ("CME_Equity", "points", "Nasdaq 100先物"),
+    "YM=F": ("CME_Equity", "points", "ダウ先物"),
+    "RTY=F": ("CME_Equity", "points", "ラッセル2000先物"),
+    "NIY=F": ("CME_Equity", "points", "CME日経225先物・円建て"),
+    "NKD=F": ("CME_Equity", "points", "CME日経225先物・ドル建て"),
+    "GC=F": ("CMEGlobex_Gold", "USD/oz", "金先物"),
+    "SI=F": ("CMEGlobex_Silver", "USD/oz", "銀先物"),
+    "CL=F": ("CMEGlobex_Crude", "USD/bbl", "WTI原油先物"),
+    "NG=F": ("CMEGlobex_NatGas", "USD/MMBtu", "天然ガス先物"),
+}
+# N225はCME円建て日経225先物。^N225は日経225指数で別物。
+ALIASES = {"N225": "NIY=F", "USDJPY": "JPY=X", "USD/JPY": "JPY=X"}
+
+
 def market_for(ticker: str) -> dict:
+    if ticker in FUTURES:
+        calendar, unit, label = FUTURES[ticker]
+        return {"calendar": calendar, "tz": "America/New_York", "currency": unit,
+                "label": label, "kind": "futures"}
+    if ticker == "JPY=X":
+        return {"calendar": "24/5", "tz": "Europe/London", "currency": "JPY per USD",
+                "label": "米ドル／円・現物為替", "kind": "forex"}
+    if ticker == "^GSPC":
+        return {"calendar": "NYSE", "tz": "America/New_York", "currency": "points",
+                "label": "S&P 500指数", "kind": "index"}
+    if ticker == "^N225":
+        return {"calendar": "JPX", "tz": "Asia/Tokyo", "currency": "points",
+                "label": "日経225指数", "kind": "index"}
     if re.fullmatch(r"[A-Z0-9]{4,6}\.T", ticker):
         return {"calendar": "JPX", "tz": "Asia/Tokyo", "currency": "JPY", "label": "日本"}
     if re.fullmatch(r"[A-Z0-9]{4,6}\.(TW|TWO)", ticker):
         return {"calendar": "XTAI", "tz": "Asia/Taipei", "currency": "TWD", "label": "台湾"}
     if re.fullmatch(r"[A-Z][A-Z0-9]{0,9}(?:-[A-Z])?", ticker):
         return {"calendar": "NYSE", "tz": "America/New_York", "currency": "USD", "label": "米国"}
-    raise ValueError("対応する形式は SPY / 1320.T / 0050.TW です。日本・台湾は接尾辞まで入力してください。")
+    raise ValueError("未対応の形式です。例：SPY、1320.T、0050.TW、ES=F、NIY=F、JPY=X。")
 
 
 @st.cache_resource(show_spinner=False)
@@ -117,8 +147,12 @@ def prepare_data(ticker: str, horizon: int) -> dict:
     for value in future.index[:horizon]:
         item = pd.Timestamp(value)
         dates.append((item.tz_localize(None) if item.tzinfo is not None else item).normalize())
-    return {"raw": raw, "hist": raw.tail(LOOKBACK), "setting": setting, "last": last,
-            "last_closed": last_closed, "future_dates": dates, "local_today": today}
+    hist = raw.tail(LOOKBACK)
+    zero_volume = int((hist["volume"] == 0).sum())
+    flat_ohlc = int((hist[["open", "high", "low", "close"]].nunique(axis=1) == 1).sum())
+    return {"raw": raw, "hist": hist, "setting": setting, "last": last,
+            "last_closed": last_closed, "future_dates": dates, "local_today": today,
+            "zero_volume": zero_volume, "flat_ohlc": flat_ohlc}
 
 
 def sample_paths(predictor, hist: pd.DataFrame, dates: list[pd.Timestamp]) -> tuple[np.ndarray, int]:
@@ -236,7 +270,7 @@ st.caption("研究・観察用。投資助言・注文機能ではありませ�
 st.warning("最新データの遅延、調整済み価格、サンプル数、取引コストと学習期間の重複に注意。小標本の一致率は将来の的中確率ではありません。")
 
 with st.form("kronos_compare_settings"):
-    ticker_input = st.text_input("Yahoo Financeティッカー（1銘柄）", value="SPY", help="米国 SPY、日本 1320.T、台湾 0050.TW。指数・暗号資産などは対象外。")
+    ticker_input = st.text_input("Yahoo Financeティッカー（1銘柄）", value="ES=F", help="先物 ES=F・NQ=F・GC=F・NIY=F、ドル円 JPY=X、株式 SPY・1320.T・0050.TW。N225はCME円建て先物、USDJPYは現物ドル円として扱います。")
     c1, c2 = st.columns(2)
     horizon = c1.selectbox("予測する営業日数", options=[1, 2, 3, 4, 5], index=2)
     backtest_count = c2.selectbox("過去検証の起点数", options=[0, 10, 20, 40, 60], index=0, help="初期値0は予測のみ。40〜60起点はCPUで時間がかかります。")
@@ -248,7 +282,8 @@ with st.form("kronos_compare_settings"):
 
 if run:
     st.session_state.pop("kronos_compare_result", None)
-    ticker = ticker_input.strip().upper()
+    entered_ticker = ticker_input.strip().upper()
+    ticker = ALIASES.get(entered_ticker, entered_ticker)
     try:
         if start > end:
             raise ValueError("検証開始日は終了日以前にしてください。")
@@ -287,7 +322,7 @@ if run:
                         skipped.append({"date": str(raw.index[i].date()), "error": str(exc)})
                 progress.progress(1.0, text=f"過去検証完了：{len(records)}起点、両モデル共通")
         st.session_state["kronos_compare_result"] = {
-            "ticker": ticker, "horizon": int(horizon), "requested": int(backtest_count),
+            "ticker": ticker, "entered_ticker": entered_ticker, "horizon": int(horizon), "requested": int(backtest_count),
             "start": start, "end": end, "prepared": prepared, "latest": latest,
             "invalid": invalid, "records": records, "skipped": skipped, "bt_error": bt_error,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -307,7 +342,23 @@ if result:
     ticker = result["ticker"]
     horizon = result["horizon"]
     st.subheader(f"{ticker}｜予測結果")
-    st.caption(f"入力最終日: {last.date()} / 調整済み終値: {anchor:,.2f} {setting['currency']} / 予測先目安: {dates[-1].date()} / 実行時刻UTC: {result['generated_at_utc']}")
+    st.caption(f"対象: {setting['label']} / 入力最終日: {last.date()} / 入力終値: {anchor:,.2f} {setting['currency']} / 予測先目安: {dates[-1].date()} / 実行時刻UTC: {result['generated_at_utc']}")
+    if result["entered_ticker"] != ticker:
+        st.info(f"入力 {result['entered_ticker']} は {ticker} として取得しました。")
+    if setting.get("kind") == "futures":
+        st.warning("先物：Yahoo Financeの日足・取引日ラベルと実際の取引所の取引日・時間は一致しない場合があります。限月切替や連続足の調整方法は未検証です。日付・価格は注文に使わず公式取引所・取引業者の情報を確認してください。")
+    elif setting.get("kind") == "forex":
+        st.warning("JPY=Xはドル円の現物為替レートで、為替先物ではありません。為替に統一された取引所終値はなく、UTC平日を日付の目安に使用します。")
+    elif setting.get("kind") == "index":
+        st.info("これは株価指数であり、先物ではありません。")
+    if prepared["zero_volume"]:
+        st.warning(f"直近{len(hist)}本のうち出来高が0の日が{prepared['zero_volume']}本あります。特に為替は取引所全体の出来高を取得できず、モデルの予測品質に影響する可能性があります。")
+    if prepared["flat_ohlc"]:
+        message = f"直近{len(hist)}本のうち始値・高値・安値・終値がすべて同じ日が{prepared['flat_ohlc']}本あります。データが十分でない可能性があります。"
+        if prepared["flat_ohlc"] / len(hist) >= 0.2:
+            st.error(message + " この予測と検証結果の利用は保留し、元データを確認してください。")
+        else:
+            st.warning(message)
     if last < prepared["last_closed"]:
         st.error(f"データ遅延または売買停止の可能性：最新足 {last.date()} / カレンダー上の直近終了日 {prepared['last_closed'].date()}。予測の利用を保留してください。")
     if ticker.endswith(".TWO"):
